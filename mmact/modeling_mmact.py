@@ -195,6 +195,13 @@ class mmACTPolicy(PreTrainedPolicy):
         
         # NOTE: custom - setting for mmact 
         print('>'*5, f'Setting mmACT policy type: [{TYPE}]')
+
+        if TYPE in ['vlmact', 'lmact']:
+            self.svla_dict = prep_vlm()
+            print('Setting normalization mapping for mmACT')
+            self.config.normalization_mapping = self.svla_dict['cfg'].normalization_mapping 
+
+
         if TYPE == 'sentact':
             self.model = sentACT(config)
         elif TYPE == 'vlmact':
@@ -202,9 +209,7 @@ class mmACTPolicy(PreTrainedPolicy):
         else:
             self.model = ACT(config)
         
-        if TYPE in ['vlmact']:
-            print('Setting normalization mapping for mmACT')
-            self.config.normalization_mapping = self.svla_dict['cfg'].normalization_mapping 
+        
         print('*'*30)
 
         if config.temporal_ensemble_coeff is not None:
@@ -268,19 +273,42 @@ class mmACTPolicy(PreTrainedPolicy):
             self._action_queue.extend(actions.transpose(0, 1))
         return self._action_queue.popleft()
 
+    def get_embs_from_vlm(self, batch):
+        
+        vla = self.svla_dict['policy']
+        vlafm = vla.model
+
+        with torch.no_grad():
+            images, img_masks = vla.prepare_images(batch)
+            state = vla.prepare_state(batch)
+
+            lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
+            lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+
+            prefix_embs, prefix_pad_masks, prefix_att_masks = vlafm.embed_prefix(
+                images, img_masks, lang_tokens, lang_masks, state=state
+            )
+        return prefix_embs
+
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         self.eval()
 
-        # svla_prep = svla_dict['preprocessor']
-        # batch = svla_prep(batch)
-        
+        # NOTE: custom. mandatory for using smolvlm
+        if TYPE in ['vlmact', 'lmact']:
+            svla_prep = self.svla_dict['preprocessor']
+            batch = svla_prep(batch)
+
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
-        actions = self.model(batch)[0]
+        if TYPE in ['vlmact', 'lmact']:
+            prefix_embs = self.get_embs_from_vlm(batch)
+            actions = self.model(batch, prefix_embs)[0]
+        else:
+            actions = self.model(batch)[0]
         return actions
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
@@ -297,26 +325,29 @@ class mmACTPolicy(PreTrainedPolicy):
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
-
         if TYPE in ['vlmact', 'lmact']:
-            vla = self.svla_dict['policy']
-            vlafm = vla.model
+            prefix_embs = self.get_embs_from_vlm(batch)
+            actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch, prefix_embs)
 
-            with torch.no_grad():
-                images, img_masks = vla.prepare_images(batch)
-                state = vla.prepare_state(batch)
+        # if TYPE in ['vlmact', 'lmact']:
+        #     vla = self.svla_dict['policy']
+        #     vlafm = vla.model
 
-                lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
-                lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        #     with torch.no_grad():
+        #         images, img_masks = vla.prepare_images(batch)
+        #         state = vla.prepare_state(batch)
 
-                prefix_embs, prefix_pad_masks, prefix_att_masks = vlafm.embed_prefix(
-                    images, img_masks, lang_tokens, lang_masks, state=state
-                )
+        #         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
+        #         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+
+        #         prefix_embs, prefix_pad_masks, prefix_att_masks = vlafm.embed_prefix(
+        #             images, img_masks, lang_tokens, lang_masks, state=state
+        #         )
 
                 # img_emb = prefix_embs[:, :192]
                 # lang_emb = prefix_embs[:, 192:198]
         
-            actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch, prefix_embs)
+            # actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch, prefix_embs)
 
         else:
             actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
